@@ -1,0 +1,97 @@
+#!/bin/sh
+# Cove-610 hardware test, installed only into the released image.
+#
+#   board-test                  list the tests
+#   board-test wifi             scan for Wi-Fi access points
+#   board-test camera [1|2]     record 3 s from MIPI-1 or MIPI-2 and save a JPEG
+#   board-test sd               write and verify a file on the SD card
+#   board-test audio [seconds]  play the microphone through the speaker
+#   board-test lcd              LVGL demo on the LCD, operated by touch
+
+# The MPP libraries need the SDK runtime environment of a login shell.
+[ -f /etc/profile.d/sdk_runtime.sh ] && . /etc/profile.d/sdk_runtime.sh
+
+pass() { echo "board-test $1: PASS${2:+ ($2)}"; exit 0; }
+fail() { echo "board-test $1: FAIL: $2" >&2; exit 1; }
+
+# The LCD and the SD card share pins; see sdio1-pins.
+need_mode()
+{
+	[ "$(sdio1-pins | sed -n 's/^running: //p')" = "$2" ] && return 0
+	fail "$1" "needs the $2 mode: run \"sdio1-pins $2\" and reboot"
+}
+
+test_wifi()
+{
+	ifconfig wlan0 up 2>/dev/null || fail wifi "wlan0 is unavailable"
+	ctrl=/var/run/wpa_supplicant
+	own=
+	if ! pidof wpa_supplicant >/dev/null; then
+		# A temporary supplicant without networks, only to scan.
+		ctrl=/tmp/board-test-wpa
+		wpa_supplicant -B -i wlan0 -Dnl80211 -C "$ctrl" -P /tmp/board-test-wpa.pid >/dev/null ||
+			fail wifi "wpa_supplicant did not start"
+		own=1
+		sleep 1
+	fi
+	wpa_cli -p "$ctrl" -i wlan0 scan >/dev/null
+	sleep 5
+	results=$(wpa_cli -p "$ctrl" -i wlan0 scan_results | sed 1d)
+	[ -n "$own" ] && kill "$(cat /tmp/board-test-wpa.pid)" 2>/dev/null
+	echo "$results"
+	count=$(echo "$results" | grep -c .)
+	[ "$count" -gt 0 ] || fail wifi "no access point found; check the antenna"
+	pass wifi "$count access points"
+}
+
+test_camera()
+{
+	mipi=${1:-1}
+	rm -f /tmp/board-test.h264 /tmp/board-test.h264.jpg
+	camera_record 3 /tmp/board-test.h264 "$mipi" || fail camera "camera_record failed on MIPI-$mipi"
+	[ -s /tmp/board-test.h264.jpg ] || fail camera "no JPEG was saved"
+	pass camera "MIPI-$mipi, /tmp/board-test.h264 and /tmp/board-test.h264.jpg"
+}
+
+test_sd()
+{
+	need_mode sd sd
+	dev=$(ls /dev/mmcblk*p1 2>/dev/null | head -n 1)
+	[ -n "$dev" ] || dev=$(ls /dev/mmcblk[0-9] 2>/dev/null | head -n 1)
+	[ -n "$dev" ] || fail sd "no SD card found"
+	dir=/tmp/board-test-sd
+	mkdir -p "$dir"
+	mount "$dev" "$dir" || fail sd "cannot mount $dev"
+	dd if=/dev/urandom of=/tmp/board-test-sd.bin bs=1024 count=4096 2>/dev/null
+	cp /tmp/board-test-sd.bin "$dir/board-test.bin" && sync
+	umount "$dir" && mount "$dev" "$dir"
+	if cmp -s /tmp/board-test-sd.bin "$dir/board-test.bin"; then ok=1; else ok=; fi
+	rm -f "$dir/board-test.bin" /tmp/board-test-sd.bin
+	umount "$dir"
+	[ -n "$ok" ] || fail sd "the data read back differs"
+	pass sd "$dev, 4 MiB written and verified"
+}
+
+test_audio()
+{
+	echo "Speak into the microphone: the speaker should play it back."
+	audio_loopback "${1:-10}" || fail audio "audio_loopback failed"
+}
+
+test_lcd()
+{
+	need_mode lcd lcd
+	echo "The LVGL demo should appear and follow touch. Ctrl-C to stop."
+	lvgl_widgets
+}
+
+case "${1:-}" in
+	wifi|camera|sd|audio|lcd)
+		name=$1
+		shift
+		"test_$name" "$@"
+		;;
+	*)
+		sed -n '4,9s/^# \{0,1\}//p' "$0"
+		;;
+esac
